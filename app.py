@@ -20,11 +20,6 @@ CORS(app)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-app = Flask(__name__)
-CORS(app)
-
-DATABASE_URL = os.environ.get("DATABASE_URL")
-
 # ─────────────────────────────────────────────
 #  CONEXIÓN
 # ─────────────────────────────────────────────
