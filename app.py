@@ -5,7 +5,6 @@ Conectada a PostgreSQL via DATABASE_URL
 """
 
 import os
-import copy
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
@@ -49,8 +48,6 @@ def query(sql, params=None, fetch="all"):
 # ─────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────
-
-carritos_db = {}   # en memoria, por sesión
 
 def error(msg, code=400):
     return jsonify({"error": msg}), code
@@ -141,6 +138,17 @@ def delete_producto(pid):
 #  CARRITO
 # ─────────────────────────────────────────────
 
+def get_carrito(cid):
+    rows = query(
+        """SELECT c.producto_id, p.nombre, c.precio, c.cantidad, c.subtotal
+           FROM abarrotes_carrito c
+           JOIN abarrotes_productos p ON p.id = c.producto_id
+           WHERE c.cliente_id = %s ORDER BY c.agregado_en""",
+        (cid,)
+    )
+    return [dict(r) for r in rows]
+
+
 @app.route("/carrito", methods=["POST"])
 def add_carrito():
     data = request.get_json()
@@ -149,27 +157,28 @@ def add_carrito():
     cid, pid, cant = data["cliente_id"], data["producto_id"], int(data["cantidad"])
     if cant <= 0:
         return error("La cantidad debe ser mayor a 0")
+
     p = query("SELECT * FROM abarrotes_productos WHERE id = %s AND activo = TRUE", (pid,), fetch="one")
     if not p:
         return error("Producto no encontrado", 404)
     p = dict(p)
+
     inv = query("SELECT stock FROM abarrotes_inventario WHERE producto_id = %s", (pid,), fetch="one")
     if not inv or inv["stock"] < cant:
         return error(f"Stock insuficiente. Disponible: {inv['stock'] if inv else 0}")
-    if cid not in carritos_db:
-        carritos_db[cid] = []
-    item = next((i for i in carritos_db[cid] if i["producto_id"] == pid), None)
-    if item:
-        item["cantidad"] += cant
-        item["subtotal"]  = round(item["cantidad"] * float(p["precio"]), 2)
-    else:
-        carritos_db[cid].append({
-            "producto_id": pid, "nombre": p["nombre"],
-            "precio": float(p["precio"]), "cantidad": cant,
-            "subtotal": round(cant * float(p["precio"]), 2),
-        })
-    total = round(sum(i["subtotal"] for i in carritos_db[cid]), 2)
-    return ok({"mensaje": "Producto agregado al carrito", "carrito": carritos_db[cid], "total": total}, 201)
+
+    # INSERT o suma si ya existe (ON CONFLICT)
+    query(
+        """INSERT INTO abarrotes_carrito (cliente_id, producto_id, cantidad, precio)
+           VALUES (%s, %s, %s, %s)
+           ON CONFLICT (cliente_id, producto_id)
+           DO UPDATE SET cantidad = abarrotes_carrito.cantidad + EXCLUDED.cantidad""",
+        (cid, pid, cant, float(p["precio"])), fetch=None
+    )
+
+    carrito = get_carrito(cid)
+    total   = round(sum(i["subtotal"] for i in carrito), 2)
+    return ok({"mensaje": "Producto agregado al carrito", "carrito": carrito, "total": total}, 201)
 
 
 @app.route("/carrito", methods=["PUT"])
@@ -178,21 +187,23 @@ def update_carrito():
     if not data or not all(k in data for k in ("cliente_id", "producto_id", "cantidad")):
         return error("Campos requeridos: cliente_id, producto_id, cantidad")
     cid, pid, cant = data["cliente_id"], data["producto_id"], int(data["cantidad"])
-    if cid not in carritos_db:
-        return error("Carrito no encontrado", 404)
-    item = next((i for i in carritos_db[cid] if i["producto_id"] == pid), None)
-    if not item:
-        return error("Producto no está en el carrito", 404)
+
     if cant <= 0:
-        carritos_db[cid] = [i for i in carritos_db[cid] if i["producto_id"] != pid]
+        query("DELETE FROM abarrotes_carrito WHERE cliente_id = %s AND producto_id = %s", (cid, pid), fetch=None)
     else:
         inv = query("SELECT stock FROM abarrotes_inventario WHERE producto_id = %s", (pid,), fetch="one")
         if inv and inv["stock"] < cant:
             return error(f"Stock insuficiente. Disponible: {inv['stock']}")
-        item["cantidad"] = cant
-        item["subtotal"] = round(cant * item["precio"], 2)
-    total = round(sum(i["subtotal"] for i in carritos_db[cid]), 2)
-    return ok({"mensaje": "Carrito actualizado", "carrito": carritos_db[cid], "total": total})
+        row = query(
+            "UPDATE abarrotes_carrito SET cantidad = %s WHERE cliente_id = %s AND producto_id = %s RETURNING id",
+            (cant, cid, pid), fetch="one"
+        )
+        if not row:
+            return error("Producto no está en el carrito", 404)
+
+    carrito = get_carrito(cid)
+    total   = round(sum(i["subtotal"] for i in carrito), 2)
+    return ok({"mensaje": "Carrito actualizado", "carrito": carrito, "total": total})
 
 
 @app.route("/carrito", methods=["DELETE"])
@@ -201,13 +212,14 @@ def delete_carrito():
     if not data or "cliente_id" not in data:
         return error("Campo requerido: cliente_id")
     cid = data["cliente_id"]
-    if cid not in carritos_db:
-        return error("Carrito no encontrado", 404)
     pid = data.get("producto_id")
+
     if pid:
-        carritos_db[cid] = [i for i in carritos_db[cid] if i["producto_id"] != pid]
-        return ok({"mensaje": f"Producto {pid} eliminado del carrito", "carrito": carritos_db[cid]})
-    carritos_db[cid] = []
+        query("DELETE FROM abarrotes_carrito WHERE cliente_id = %s AND producto_id = %s", (cid, pid), fetch=None)
+        carrito = get_carrito(cid)
+        return ok({"mensaje": f"Producto {pid} eliminado del carrito", "carrito": carrito})
+
+    query("DELETE FROM abarrotes_carrito WHERE cliente_id = %s", (cid,), fetch=None)
     return ok({"mensaje": "Carrito vaciado"})
 
 # ─────────────────────────────────────────────
@@ -219,11 +231,11 @@ def create_pedido():
     data = request.get_json()
     if not data or "cliente_id" not in data:
         return error("Campo requerido: cliente_id")
-    cid = data["cliente_id"]
-    if cid not in carritos_db or not carritos_db[cid]:
+    cid   = data["cliente_id"]
+    items = get_carrito(cid)
+    if not items:
         return error("El carrito está vacío. Agregue productos antes de crear un pedido.", 400)
-    items = carritos_db[cid]
-    conn  = get_conn()
+    conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             for item in items:
@@ -235,7 +247,7 @@ def create_pedido():
                 if not inv or inv["stock"] < item["cantidad"]:
                     conn.rollback()
                     return error(f"Stock insuficiente para '{item['nombre']}'. Disponible: {inv['stock'] if inv else 0}")
-            total = round(sum(i["subtotal"] for i in items), 2)
+            total = round(sum(float(i["subtotal"]) for i in items), 2)
             cur.execute(
                 "INSERT INTO abarrotes_pedidos (cliente_id, estado, total) VALUES (%s, 'pendiente', %s) RETURNING *",
                 (cid, total)
@@ -255,9 +267,9 @@ def create_pedido():
                 (pedido["id"],)
             )
             pedido = dict(cur.fetchone())
+            cur.execute("DELETE FROM abarrotes_carrito WHERE cliente_id = %s", (cid,))
         conn.commit()
-        carritos_db[cid] = []
-        pedido["items"] = copy.deepcopy(items)
+        pedido["items"] = items
         return ok({"mensaje": "Pedido creado exitosamente", "pedido": pedido}, 201)
     except Exception as e:
         conn.rollback()
